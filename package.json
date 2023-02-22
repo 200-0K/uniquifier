@@ -1,0 +1,15 @@
+{
+  "name": "uniquifier",
+  "version": "1.0.0",
+  "description": "",
+  "main": "uniquifier.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "folder-hash": "^4.0.1"
+  }
+}
