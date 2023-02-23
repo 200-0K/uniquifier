@@ -130,3 +130,6 @@ dist
 .pnp.*
 
 __*
+
+storage/log/**/*.json
+storage/log/**/*.log

@@ -1,2 +1,2 @@
 @echo off
-node %~dp0..\uniquifier.js
+node %~dp0..\uniquifier.js %*

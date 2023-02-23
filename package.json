@@ -11,5 +11,10 @@
   "license": "ISC",
   "devDependencies": {
     "folder-hash": "^4.0.1"
+  },
+  "dependencies": {
+    "glob": "^8.1.0",
+    "glob-escape": "^0.0.2",
+    "moment": "^2.29.4"
   }
 }
