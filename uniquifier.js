@@ -36,7 +36,7 @@ async function main() {
   }
 
   const workingPath = path.resolve(workingDir, process.argv[2]);
-  if (!fileExist(process.argv[2])) {
+  if (!fileExist(workingPath)) {
     console.error('You have to provide a valid location');
     return;
   }
@@ -58,13 +58,14 @@ async function main() {
 }
 
 function prefixFilesByFolder(folder, { logLabel } = {}) {
-  const unique = getUniqueText(path.basename(path.dirname(folder)));
+  const unique = getUniqueText(path.basename(folder));
   logLabel = logLabel ?? path.basename(folder)
-  for (const file of getFiles(folder, '*.*', false)) {
+  const files = getFiles(folder, '*.*', false)
+  for (const file of files) {
     prefixFile(file, unique);
     console.count(`Processed From '${logLabel}'`);
   }
-  console.log();
+  if (files.length > 0) console.log();
 }
 
 function prefixFile(file, prefix = null) {
