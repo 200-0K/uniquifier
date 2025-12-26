@@ -20,6 +20,7 @@ const LOG_PATH = path.resolve(
 );
 const workingDir = process.cwd();
 const renamed = {}
+let pendingChanges = 0;
 
 let countLabels = {};
 console.count = label => {
@@ -27,6 +28,11 @@ console.count = label => {
   countLabels[label]++;
   process.stdout.write(`${label}: ${countLabels[label]}\r`);
 };
+
+async function saveLog() {
+  await writeFile(LOG_PATH, JSON.stringify(renamed, null, 2));
+  pendingChanges = 0;
+}
 
 main();
 async function main() {
@@ -36,20 +42,27 @@ async function main() {
   }
 
   const workingPath = path.resolve(workingDir, process.argv[2]);
-  if (!fileExist(workingPath)) {
+  if (!(await fileExist(workingPath))) {
     console.error('You have to provide a valid location');
     return;
   }
 
-  if (isFile(workingPath)) {
-    prefixFile(workingPath);
-  } else if (isDirectory(workingPath)) {
+  if (await isFile(workingPath)) {
+    await prefixFile(workingPath);
+    await saveLog();
+  } else if (await isDirectory(workingPath)) {
     console.log('Processing:', workingPath);
-    const folders = getFolders(workingPath);
-    prefixFilesByFolder(workingPath);
+    const folders = await getFolders(workingPath);
+
+    // Process root folder files
+    await prefixFilesByFolder(workingPath);
+
+    // Process subfolders
     for (const folder of folders) {
-      prefixFilesByFolder(folder, { logLabel: path.relative(workingPath, folder) });
+      await prefixFilesByFolder(folder, { logLabel: path.relative(workingPath, folder) });
     }
+
+    await saveLog(); // Final save
     console.log(
       `Total: ${Object.values(countLabels).reduce((acc, cur) => acc + cur, 0)}`
     );
@@ -57,25 +70,36 @@ async function main() {
   } else console.error(`Provide either a file path or a directory path`);
 }
 
-function prefixFilesByFolder(folder, { logLabel } = {}) {
+async function prefixFilesByFolder(folder, { logLabel } = {}) {
   const unique = getUniqueText(path.basename(folder));
   logLabel = logLabel ?? path.basename(folder)
-  const files = getFiles(folder, '*.*', false)
-  for (const file of files) {
-    prefixFile(file, unique);
-    console.count(`Processed From '${logLabel}'`);
+  const files = await getFiles(folder, '*.*', false)
+
+  // Process files in parallel for this folder
+  await Promise.all(files.map(file => prefixFile(file, unique)));
+
+  if (files.length > 0) {
+    countLabels[`Processed From '${logLabel}'`] = (countLabels[`Processed From '${logLabel}'`] || 0) + files.length;
+    console.log(`Processed From '${logLabel}': ${files.length}`);
+
+    // Periodic log save every 100 files
+    if (pendingChanges > 100) {
+      await saveLog();
+    }
   }
-  if (files.length > 0) console.log();
 }
 
-function prefixFile(file, prefix = null) {
+async function prefixFile(file, prefix = null) {
   prefix = prefix ?? getUniqueText(path.basename(path.dirname(file)));
-  const renamePath = path.resolve(path.dirname(file), prefix+path.basename(file))
+  const renamePath = path.resolve(path.dirname(file), prefix + path.basename(file))
 
-  if (renameFile(file, renamePath)) {
-    renamed[file] = renamePath
-    writeFile(LOG_PATH, JSON.stringify(renamed))
-  } else console.error(`Error Renaming ${file} to ${renamePath}`)
+  const result = await renameFile(file, renamePath);
+  if (result) {
+    renamed[file] = renamePath;
+    pendingChanges++;
+  } else {
+    console.error(`Error Renaming ${file} to ${renamePath}`);
+  }
 }
 
 function getUniqueText(cryptoSuffix = null) {
