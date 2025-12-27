@@ -4,6 +4,7 @@
 const path = require('path');
 const crypto = require('crypto');
 const os = require('os');
+const fs = require('fs/promises');
 const chalk = require('chalk');
 const {
   fileExist,
@@ -18,11 +19,6 @@ const pLimit = require('p-limit');
 const ProgressManager = require('./utils/ProgressManager');
 const moment = require('moment/moment');
 
-const LOG_PATH = path.resolve(
-  __dirname,
-  `storage/log/${moment().format('YYYY-MM-DD_HH-mm-ss')}~${getRandomHex()}.json`
-);
-
 const workingDir = process.cwd();
 const renamed = {};
 let pendingChanges = 0;
@@ -31,9 +27,43 @@ let countLabels = {};
 // Buffer errors so they do NOT print during progress
 const errors = [];
 
-async function saveLog() {
-  await writeFile(LOG_PATH, JSON.stringify(renamed, null, 2));
-  pendingChanges = 0;
+/**
+ * -----------------------------
+ * Logging config (prevents bloat)
+ * -----------------------------
+ * Disable logs:
+ *   UNIQUIFIER_LOG=0
+ *
+ * Keep last N logs (default 20):
+ *   UNIQUIFIER_LOG_KEEP=30
+ *
+ * Delete logs older than X days (default 14):
+ *   UNIQUIFIER_LOG_MAX_DAYS=7
+ *
+ * Cap total log dir size in MB (default 200):
+ *   UNIQUIFIER_LOG_MAX_TOTAL_MB=100
+ *
+ * Log mode:
+ *   UNIQUIFIER_LOG_MODE=full     (default, includes full "renamed" map)
+ *   UNIQUIFIER_LOG_MODE=summary  (small log, no huge map)
+ */
+const LOG_DIR = path.resolve(__dirname, 'storage/log');
+const LOG_ENABLED = !['0', 'false', 'off', 'no'].includes(
+  String(process.env.UNIQUIFIER_LOG ?? '').toLowerCase()
+);
+const LOG_KEEP = Math.max(1, parseInt(process.env.UNIQUIFIER_LOG_KEEP || '50', 10));
+const LOG_MAX_DAYS = Math.max(1, parseInt(process.env.UNIQUIFIER_LOG_MAX_DAYS || '14', 10));
+const LOG_MAX_TOTAL_MB = Math.max(1, parseInt(process.env.UNIQUIFIER_LOG_MAX_TOTAL_MB || '200', 10));
+const LOG_MAX_TOTAL_BYTES = LOG_MAX_TOTAL_MB * 1024 * 1024;
+const LOG_MODE = String(process.env.UNIQUIFIER_LOG_MODE || 'full').toLowerCase(); // full|summary
+
+let LOG_PATH = null;
+let logWritten = false;
+const startedAt = new Date();
+
+function firstLine(msg) {
+  if (!msg) return '';
+  return String(msg).split(/\r?\n/)[0];
 }
 
 function ellipsizeStart(str, max) {
@@ -43,17 +73,6 @@ function ellipsizeStart(str, max) {
   return '…' + s.slice(s.length - (max - 1));
 }
 
-function firstLine(msg) {
-  if (!msg) return '';
-  return String(msg).split(/\r?\n/)[0];
-}
-
-/**
- * Decide concurrency:
- * - default: available CPU threads
- * - BUT clamp to terminal height so progress bars don't scroll/glitch
- * - override: UNIQUIFIER_JOBS or JOBS env var
- */
 function resolveConcurrency(progressStream = process.stderr) {
   const cpuCount =
     (typeof os.availableParallelism === 'function'
@@ -65,16 +84,13 @@ function resolveConcurrency(progressStream = process.stderr) {
       ? progressStream.rows
       : 0;
 
-  // We draw: N worker lines + 1 overall line (plus a little breathing room).
-  // If rows is unknown (not a TTY), don’t clamp.
+  // N worker lines + 1 overall line + a bit of breathing room.
   const maxByRows = rows > 0 ? Math.max(1, rows - 4) : Number.POSITIVE_INFINITY;
 
   const env = process.env.UNIQUIFIER_JOBS || process.env.JOBS;
   const forced = env ? parseInt(env, 10) : NaN;
-
   const base = Number.isFinite(forced) && forced > 0 ? forced : cpuCount;
 
-  // Clamp to avoid scrolling, which causes glitches on Windows terminals
   return Math.max(1, Math.min(base, maxByRows));
 }
 
@@ -90,6 +106,131 @@ function silenceConsoleError(progressManager) {
     });
   };
   return () => { console.error = orig; };
+}
+
+async function ensureLogReady() {
+  if (!LOG_ENABLED) return;
+  if (LOG_PATH) return;
+
+  await fs.mkdir(LOG_DIR, { recursive: true });
+  LOG_PATH = path.resolve(
+    LOG_DIR,
+    `${moment().format('YYYY-MM-DD_HH-mm-ss')}~${getRandomHex()}.json`
+  );
+}
+
+function buildLogObject({ workingPath, finishedAt }) {
+  const base = {
+    startedAt: startedAt.toISOString(),
+    finishedAt: finishedAt.toISOString(),
+    workingPath,
+    totalRenamed: Object.keys(renamed).length,
+    errorsCount: errors.length,
+    errors: errors.map(e => ({
+      file: e.file,
+      code: e.code || 'ERR',
+      message: firstLine(e.message),
+    })),
+  };
+
+  if (LOG_MODE === 'summary') return base;
+
+  // full mode: include mapping (can be large)
+  return {
+    ...base,
+    renamed,
+  };
+}
+
+async function saveLog(workingPath) {
+  if (!LOG_ENABLED) return;
+
+  // If nothing happened and no errors, skip creating a log file at all
+  if (Object.keys(renamed).length === 0 && errors.length === 0) return;
+
+  await ensureLogReady();
+  const obj = buildLogObject({ workingPath, finishedAt: new Date() });
+
+  await writeFile(LOG_PATH, JSON.stringify(obj, null, 2));
+  logWritten = true;
+  pendingChanges = 0;
+}
+
+async function cleanupLogs() {
+  if (!LOG_ENABLED) return;
+
+  try {
+    await fs.mkdir(LOG_DIR, { recursive: true });
+  } catch (_) { }
+
+  let dirents;
+  try {
+    dirents = await fs.readdir(LOG_DIR, { withFileTypes: true });
+  } catch (_) {
+    return;
+  }
+
+  const jsonFiles = dirents
+    .filter(d => d.isFile() && d.name.toLowerCase().endsWith('.json'))
+    .map(d => path.join(LOG_DIR, d.name));
+
+  const stats = [];
+  for (const file of jsonFiles) {
+    try {
+      const st = await fs.stat(file);
+      stats.push({ file, mtimeMs: st.mtimeMs, size: st.size });
+    } catch (_) { }
+  }
+
+  // 1) Delete by age
+  const cutoff = Date.now() - LOG_MAX_DAYS * 24 * 60 * 60 * 1000;
+  for (const s of stats) {
+    if (s.mtimeMs < cutoff) {
+      try { await fs.unlink(s.file); } catch (_) { }
+    }
+  }
+
+  // refresh after deletes
+  let remaining = [];
+  try {
+    const after = await fs.readdir(LOG_DIR, { withFileTypes: true });
+    const files = after
+      .filter(d => d.isFile() && d.name.toLowerCase().endsWith('.json'))
+      .map(d => path.join(LOG_DIR, d.name));
+
+    for (const f of files) {
+      try {
+        const st = await fs.stat(f);
+        remaining.push({ file: f, mtimeMs: st.mtimeMs, size: st.size });
+      } catch (_) { }
+    }
+  } catch (_) {
+    return;
+  }
+
+  // Sort newest -> oldest
+  remaining.sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+  // 2) Keep only last LOG_KEEP
+  if (remaining.length > LOG_KEEP) {
+    const toDelete = remaining.slice(LOG_KEEP);
+    for (const s of toDelete) {
+      try { await fs.unlink(s.file); } catch (_) { }
+    }
+    remaining = remaining.slice(0, LOG_KEEP);
+  }
+
+  // 3) Enforce total size cap (delete oldest until within limit)
+  let total = remaining.reduce((acc, s) => acc + s.size, 0);
+  if (total > LOG_MAX_TOTAL_BYTES) {
+    // delete oldest first => iterate from end
+    for (let i = remaining.length - 1; i >= 0 && total > LOG_MAX_TOTAL_BYTES; i--) {
+      try {
+        await fs.unlink(remaining[i].file);
+        total -= remaining[i].size;
+      } catch (_) { }
+    }
+  }
 }
 
 function printErrorReport(errs, { maxList = 60 } = {}) {
@@ -135,9 +276,13 @@ async function main() {
     return;
   }
 
+  // Cleanup old logs early (prevents bloat)
+  await cleanupLogs();
+
   if (await isFile(workingPath)) {
     await prefixFile(workingPath);
-    await saveLog();
+    await saveLog(workingPath);
+    if (logWritten) console.log(`Log File: ${LOG_PATH}`);
     return;
   }
 
@@ -160,10 +305,7 @@ async function main() {
   const restoreConsoleError = silenceConsoleError(progressManager);
 
   progressManager.log(
-    `Processing: ${workingPath} | workers=${CONCURRENCY} | cpus=${(typeof os.availableParallelism === 'function'
-      ? os.availableParallelism()
-      : (os.cpus()?.length || 1))
-    }`
+    `Processing: ${workingPath} | workers=${CONCURRENCY} | log=${LOG_ENABLED ? LOG_MODE : 'off'}`
   );
 
   const tasks = allFolders.map(folder =>
@@ -171,13 +313,15 @@ async function main() {
       prefixFilesByFolder(folder, {
         logLabel: path.relative(workingPath, folder) || path.basename(folder),
         progressManager,
+        workingPath,
       })
     )
   );
 
   await Promise.all(tasks);
 
-  await saveLog();
+  // final log + stop UI
+  await saveLog(workingPath);
   progressManager.stop();
   restoreConsoleError();
 
@@ -187,10 +331,12 @@ async function main() {
   console.log(
     `Total: ${Object.values(countLabels).reduce((acc, cur) => acc + cur, 0)}`
   );
-  console.log(`Log File: ${LOG_PATH}`);
+
+  if (logWritten) console.log(`Log File: ${LOG_PATH}`);
+  else console.log(`Log File: (skipped — no changes/errors, or logging disabled)`);
 }
 
-async function prefixFilesByFolder(folder, { logLabel, progressManager } = {}) {
+async function prefixFilesByFolder(folder, { logLabel, progressManager, workingPath } = {}) {
   const unique = getUniqueText(path.basename(folder));
   logLabel = logLabel ?? path.basename(folder);
 
@@ -224,7 +370,10 @@ async function prefixFilesByFolder(folder, { logLabel, progressManager } = {}) {
     countLabels[`Processed From '${logLabel}'`] =
       (countLabels[`Processed From '${logLabel}'`] || 0) + files.length;
 
-    if (pendingChanges > 100) await saveLog();
+    // Periodic log save every 100 changes (writes to SAME file; no bloat)
+    if (pendingChanges > 100) {
+      await saveLog(workingPath);
+    }
   }
 
   progressManager.releaseBar(handle);
