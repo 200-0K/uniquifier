@@ -13,8 +13,11 @@
     "folder-hash": "^4.0.1"
   },
   "dependencies": {
-    "glob": "^8.1.0",
+    "fast-glob": "^3.3.3",
     "glob-escape": "^0.0.2",
-    "moment": "^2.29.4"
+    "moment": "^2.29.4",
+    "cli-progress": "^3.12.0",
+    "p-limit": "^3.1.0",
+    "chalk": "^4.1.2"
   }
 }
