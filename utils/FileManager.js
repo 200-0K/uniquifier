@@ -1,51 +1,71 @@
-const fs = require('fs');
+const fs = require('fs').promises;
+const fsSync = require('fs');
 const path = require('path');
 const escapeGlob = require('glob-escape');
-const glob = require('glob');
+const fg = require('fast-glob');
 
-function fileExist(p) {
+async function fileExist(p) {
   try {
-    return fs.existsSync(p);
+    await fs.access(p);
+    return true;
   } catch (e) {
-    console.error(e);
-    return null;
+    return false;
   }
+}
+
+function fileExistSync(p) {
+  return fsSync.existsSync(p);
 }
 
 /**
  *
  * @param {string} p path
  * @param {string} ext file extension to search for
- * @returns {Array<string>} array of files with similar name but different extensions (e.g., a.txt, a.xmp, a.html, etc)
+ * @returns {Promise<Array<string>>} array of files with similar name but different extensions (e.g., a.txt, a.xmp, a.html, etc)
  */
-function similarFilesByName(p, ext = '*') {
+async function similarFilesByName(p, ext = '*') {
   try {
-    const similarFiles = glob
-    .sync(`${escapeGlob(getFilePathWithoutExt(p).replace(/\\/g, '/'))}.${ext}`, {
-      nodir: true
-    })
-    .filter(file => path.resolve(file) != path.resolve(p));
-    return similarFiles;
+    const pattern = `${escapeGlob(getFilePathWithoutExt(p).replace(/\\/g, '/'))}.${ext}`;
+    const files = await fg(pattern, { onlyFiles: true, absolute: true });
+    return files.filter(file => path.resolve(file) != path.resolve(p));
   } catch (e) {
     console.error(e);
     return null;
   }
 }
 
-function isFile(p) {
+async function isFile(p) {
   try {
-    return fs.lstatSync(p).isFile();
+    const stats = await fs.lstat(p);
+    return stats.isFile();
   } catch (e) {
     console.error(e);
     return null;
   }
 }
 
-function isDirectory(p) {
+function isFileSync(p) {
   try {
-    return fs.lstatSync(p).isDirectory();
+    return fsSync.lstatSync(p).isFile();
+  } catch (e) {
+    return null;
+  }
+}
+
+async function isDirectory(p) {
+  try {
+    const stats = await fs.lstat(p);
+    return stats.isDirectory();
   } catch (e) {
     console.error(e);
+    return null;
+  }
+}
+
+function isDirectorySync(p) {
+  try {
+    return fsSync.lstatSync(p).isDirectory();
+  } catch (e) {
     return null;
   }
 }
@@ -64,35 +84,36 @@ function getFilePathWithoutExt(p) {
   return path.resolve(dir, name)
 }
 
-function getFiles(p, pattern = '*.*', recurse = true) {
-  let resolveArgs = [escapeGlob( path.resolve(p).replace(/\\/g, '/') )]
-  if (recurse) resolveArgs.push('**')
-  resolveArgs.push(pattern)
-  return glob.sync(resolveArgs.join('/'), {
-    nodir: true
-  });
+async function getFiles(p, pattern = '*.*', recurse = true) {
+  const base = path.resolve(p).replace(/\\/g, '/');
+  const globPattern = recurse
+    ? `${escapeGlob(base)}/**/${pattern}`
+    : `${escapeGlob(base)}/${pattern}`;
+
+  return await fg(globPattern, { onlyFiles: true, absolute: true });
 }
 
-function getFolders(p, pattern = '*', recurse = true) {
-  let resolveArgs = [escapeGlob( path.resolve(p).replace(/\\/g, '/') )]
-  if (recurse) resolveArgs.push('**')
-  resolveArgs.push(pattern)
-  resolveArgs.push('') // to add '/' at the end when joining
-  return glob.sync(resolveArgs.join('/'));
+async function getFolders(p, pattern = '*', recurse = true) {
+  const base = path.resolve(p).replace(/\\/g, '/');
+  const globPattern = recurse
+    ? `${escapeGlob(base)}/**/${pattern}`
+    : `${escapeGlob(base)}/${pattern}`;
+
+  return await fg(globPattern, { onlyDirectories: true, absolute: true });
 }
 
-function readFile(p) {
+async function readFile(p) {
   try {
-    return fs.readFileSync(p, 'utf8').toString();
+    return await fs.readFile(p, 'utf8');
   } catch (e) {
     console.error(e);
     return null;
   }
 }
 
-function writeFile(p, data) {
+async function writeFile(p, data) {
   try {
-    fs.writeFileSync(p, data, { encoding: 'utf8' })
+    await fs.writeFile(p, data, { encoding: 'utf8' })
     return true
   } catch (e) {
     console.error(e)
@@ -100,11 +121,11 @@ function writeFile(p, data) {
   }
 }
 
-function appendFile(p, data, force = false) {
+async function appendFile(p, data, force = false) {
   const options = { encoding: 'utf8' }
   if (force) options.flag = 'a+'
   try {
-    fs.appendFileSync(p, data, options)
+    await fs.appendFile(p, data, options)
     return true
   } catch (e) {
     console.error(e)
@@ -112,10 +133,10 @@ function appendFile(p, data, force = false) {
   }
 }
 
-function renameFile(oldPath, newPath) {
+async function renameFile(oldPath, newPath) {
   if (oldPath === newPath) return;
   try {
-    fs.renameSync(oldPath, newPath);
+    await fs.rename(oldPath, newPath);
     return newPath;
   } catch (e) {
     console.error(e);
@@ -125,10 +146,13 @@ function renameFile(oldPath, newPath) {
 
 module.exports = {
   fileExist,
+  fileExistSync,
   similarFilesByName,
   getFilePathWithoutExt,
   isFile,
+  isFileSync,
   isDirectory,
+  isDirectorySync,
   getFileExt,
   getFiles,
   getFolders,
