@@ -265,63 +265,116 @@ function printErrorReport(errs, { maxList = 60 } = {}) {
 
 main();
 async function main() {
-  if (!process.argv[2]) {
-    console.error('You have to provide a location');
-    return;
-  }
-
-  const workingPath = path.resolve(workingDir, process.argv[2]);
-  if (!(await fileExist(workingPath))) {
-    console.error('You have to provide a valid location');
+  const args = process.argv.slice(2);
+  if (args.length === 0) {
+    console.error('You have to provide at least one location');
     return;
   }
 
   // Cleanup old logs early (prevents bloat)
   await cleanupLogs();
 
-  if (await isFile(workingPath)) {
-    await prefixFile(workingPath);
-    await saveLog(workingPath);
-    if (logWritten) console.log(`Log File: ${LOG_PATH}`);
-    return;
+  const allFolderTasks = [];
+  const allFileTasks = [];
+  const validPaths = [];
+  const folderSet = new Set();
+
+  for (const arg of args) {
+    const p = path.resolve(workingDir, arg);
+    if (!(await fileExist(p))) {
+      console.error(chalk.yellow(`Warning: Location does not exist: ${arg}`));
+      continue;
+    }
+    validPaths.push(p);
+
+    if (await isFile(p)) {
+      allFileTasks.push(p);
+    } else if (await isDirectory(p)) {
+      const subfolders = await getFolders(p);
+      const foldersToProcess = [p, ...subfolders];
+      for (const folder of foldersToProcess) {
+        if (!folderSet.has(folder)) {
+          folderSet.add(folder);
+          allFolderTasks.push({ root: p, folder: folder });
+        }
+      }
+    }
   }
 
-  if (!(await isDirectory(workingPath))) {
-    console.error(`Provide either a file path or a directory path`);
+  if (allFolderTasks.length === 0 && allFileTasks.length === 0) {
+    if (validPaths.length > 0) {
+      console.error('No valid files or directories to process');
+    }
     return;
   }
-
-  const folders = await getFolders(workingPath);
-  const allFolders = [workingPath, ...folders];
 
   const PROGRESS_STREAM = process.stderr;
   const CONCURRENCY = resolveConcurrency(PROGRESS_STREAM);
 
   const limit = pLimit(CONCURRENCY);
-  const progressManager = new ProgressManager(CONCURRENCY, allFolders.length, {
+
+  // We treat all individual files as one "task" for the progress manager if there are any
+  const totalTasks = allFolderTasks.length + (allFileTasks.length > 0 ? 1 : 0);
+
+  const progressManager = new ProgressManager(CONCURRENCY, totalTasks, {
     stream: PROGRESS_STREAM,
   });
 
   const restoreConsoleError = silenceConsoleError(progressManager);
 
+  const logLabel = validPaths.length === 1 ? validPaths[0] : `${validPaths.length} paths`;
   progressManager.log(
-    `Processing: ${workingPath} | workers=${CONCURRENCY} | log=${LOG_ENABLED ? LOG_MODE : 'off'}`
+    `Processing: ${logLabel} | workers=${CONCURRENCY} | log=${LOG_ENABLED ? LOG_MODE : 'off'}`
   );
 
-  const tasks = allFolders.map(folder =>
-    limit(() =>
-      prefixFilesByFolder(folder, {
-        logLabel: path.relative(workingPath, folder) || path.basename(folder),
-        progressManager,
-        workingPath,
+  const tasks = [];
+
+  // 1. Folder tasks
+  for (const { root, folder } of allFolderTasks) {
+    tasks.push(
+      limit(() =>
+        prefixFilesByFolder(folder, {
+          logLabel: path.relative(root, folder) || path.basename(folder),
+          progressManager,
+          workingPath: root,
+        })
+      )
+    );
+  }
+
+  // 2. Individual files task
+  if (allFileTasks.length > 0) {
+    tasks.push(
+      limit(async () => {
+        const handle = progressManager.acquireBar('Individual Files', allFileTasks.length);
+        const fileLimit = pLimit(50);
+        await Promise.all(
+          allFileTasks.map(file =>
+            fileLimit(async () => {
+              const res = await prefixFile(file);
+              progressManager.updateBar(handle, 1, path.basename(file));
+              if (!res.ok) {
+                progressManager.addError(1);
+                errors.push({
+                  file,
+                  code: res.error?.code || 'ERR',
+                  message: res.error?.message || 'rename failed',
+                });
+              }
+            })
+          )
+        );
+        countLabels['Individual Files'] = (countLabels['Individual Files'] || 0) + allFileTasks.length;
+        progressManager.releaseBar(handle);
       })
-    )
-  );
+    );
+  }
 
   await Promise.all(tasks);
 
   // final log + stop UI
-  await saveLog(workingPath);
+  const finalWorkingPath = validPaths.length === 1 ? validPaths[0] : validPaths.join('; ');
+  await saveLog(finalWorkingPath);
   progressManager.stop();
   restoreConsoleError();
 
